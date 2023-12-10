@@ -1,0 +1,14 @@
+{
+  "daemon": "ngts_m06_focuser",
+  "log_name": "focusd@ngts_m06",
+  "control_machines": ["NGTSDASNUC"],
+  "serial_port": "/dev/focuser",
+  "serial_baud": 38400,
+  "serial_timeout": 5,
+  "move_timeout": 180,
+  "steps_per_mm": 5088,
+  "anti_backlash_mm": 0.5,
+  "focus_range_mm": 6.0,
+  "speed_mm_sec": 0.5,
+  "acceleration_mm_sec_sec": 5
+}

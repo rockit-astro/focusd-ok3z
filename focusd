@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+#
+# This file is part of the Robotic Observatory Control Kit (rockit)
+#
+# rockit is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# rockit is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with rockit.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Daemon for controlling an ASA OK3Z focuser via Pyro"""
+
+import argparse
+import re
+import threading
+import time
+import sys
+import traceback
+
+import serial
+from astropy.time import Time
+import astropy.units as u
+import Pyro4
+from rockit.common import log, TryLock
+from rockit.common.helpers import pyro_client_matches
+from rockit.focuser.ok3z import CommandStatus, Config, FocuserStatus
+
+
+def write_stepper_parameter(port, param, value):
+    message = f'#{param} F {value}$\n'.encode('ascii')
+    if port.write(message) != len(message):
+        raise serial.SerialException(f'Failed to write command: `{message}`')
+
+
+def read_stepper_parameter(port, param, response_prefix):
+    port.write(f'#{param} F$\n'.encode('ascii'))
+    response = port.read_until().decode('ascii')
+    match = re.compile(f'#{response_prefix} F (?P<value>[^\\$]+)\\$\\n$').fullmatch(response)
+    if not match:
+        raise serial.SerialException(f'Failed to parse response `{response}` as response type `{response_prefix}`')
+
+    return match.group('value')
+
+
+class OK3ZFocuserDaemon:
+    """Daemon interface for an ASA OK3Z focuser"""
+    def __init__(self, config):
+        self._config = config
+        self._command_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+
+        # The measured encoder position at the fully in position
+        self._stepper_origin = 0
+        self._target_mm = 0
+        self._current_mm = 0
+        self._moving = False
+        self._request_stop = False
+        self._port = None
+
+    def __commit(self):
+        """Move the focuser to the position stored in _target_mm"""
+        def poll_until_stopped():
+            start = Time.now()
+            while True:
+                steps = int(read_stepper_parameter(self._port, 'P081', 'P081'))
+                status = read_stepper_parameter(self._port, "S001", "S004")
+                if self._request_stop:
+                    write_stepper_parameter(self._port, 'P021', '')
+                    self._request_stop = False
+
+                with self._state_lock:
+                    self._current_mm = round((self._stepper_origin - steps) / self._config.steps_per_mm, 3)
+
+                    if status[1] == 'S':
+                        # Reset target to avoid issues with rounding and stop requests
+                        self._target_mm = self._current_mm
+                        return
+
+                    if Time.now() - start > self._config.move_timeout * u.s:
+                        raise TimeoutError('Timeout while moving')
+
+                    time.sleep(0.1)
+
+        try:
+            with self._state_lock:
+                self._moving = True
+
+            current_steps = int(read_stepper_parameter(self._port, 'P081', 'P081'))
+            target_steps = int(self._stepper_origin - self._target_mm * self._config.steps_per_mm)
+
+            if target_steps > current_steps:
+                write_stepper_parameter(self._port, 'P092', str(target_steps))
+            else:
+                # Move 0.5mm past the target then back in to reduce backlash
+                anti_backlash_steps = int(target_steps - self._config.anti_backlash_mm * self._config.steps_per_mm)
+                write_stepper_parameter(self._port, 'P092', str(anti_backlash_steps))
+                poll_until_stopped()
+                write_stepper_parameter(self._port, 'P092', str(target_steps))
+
+            poll_until_stopped()
+            return CommandStatus.Succeeded
+        except:
+            print('error while moving focuser')
+            traceback.print_exc(file=sys.stdout)
+            return CommandStatus.Failed
+        finally:
+            with self._state_lock:
+                self._moving = False
+
+    @Pyro4.expose
+    def initialize(self):
+        """Connects to the device"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._port is not None:
+                return CommandStatus.NotDisconnected
+
+            port = None
+            try:
+                port = serial.Serial(self._config.serial_port,
+                                     self._config.serial_baud,
+                                     timeout=self._config.serial_timeout)
+                log.info(self._config.log_name, 'connected to focuser')
+
+                # Flush any stale state
+                port.flushInput()
+                port.flushOutput()
+
+                # Ping the device to check it is connected
+                read_stepper_parameter(port, 'S051', 'S052')
+
+                speed = int(self._config.speed_mm_sec * self._config.steps_per_mm * 0.065636 / 4)
+                write_stepper_parameter(port, 'P132', str(speed))
+
+                acceleration = int(self._config.acceleration_mm_sec_sec * self._config.steps_per_mm * 0.068719476 / 4)
+                write_stepper_parameter(port, 'P052', str(acceleration))
+                write_stepper_parameter(port, 'P062', str(acceleration))
+
+                # Stop before setting microsteps
+                write_stepper_parameter(port, 'P031', '')
+                write_stepper_parameter(port, 'E002', '3')
+
+                # Move to the fully in position
+                write_stepper_parameter(port, 'P103', 'V 21341')
+
+                # Wait for it to stop moving
+                start = Time.now()
+                while True:
+                    status = read_stepper_parameter(port, "S001", "S004")
+                    if status[1] == 'S':
+                        break
+
+                    if Time.now() - start > self._config.move_timeout * u.s:
+                        raise TimeoutError('Timeout while homing')
+
+                    time.sleep(0.1)
+
+                write_stepper_parameter(port, 'P021', '')
+
+                self._stepper_origin = int(read_stepper_parameter(port, 'P081', 'P081'))
+                with self._state_lock:
+                    self._port = port
+                    self._current_mm = self._target_mm = 0
+
+                log.info(self._config.log_name, 'Focuser initialized')
+
+                return CommandStatus.Succeeded
+            except:
+                print('error while initializing focuser')
+                traceback.print_exc(file=sys.stdout)
+                if port:
+                    port.close()
+                return CommandStatus.Failed
+
+    @Pyro4.expose
+    def shutdown(self):
+        """Disconnects from the device"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._port is None:
+                return CommandStatus.NotConnected
+
+            log.info(self._config.log_name, 'Focuser disconnected')
+            with self._state_lock:
+                self._port.close()
+                self._port = None
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def report_status(self):
+        """Returns a dictionary containing the current focuser state"""
+        with self._state_lock:
+            data = {
+                'date': Time.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'status': FocuserStatus.Disabled
+            }
+
+            if self._port is not None:
+                data.update({
+                    'status': FocuserStatus.Moving if self._moving else FocuserStatus.Idle,
+                    'current_mm': self._current_mm,
+                    'target_mm': self._target_mm
+                })
+
+            return data
+
+    @Pyro4.expose
+    def set_focus(self, pos, offset=False):
+        """Request focuser to move a specific step position"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._port is None:
+                return CommandStatus.NotConnected
+
+            with self._state_lock:
+                target_mm = self._target_mm + pos if offset else pos
+                if target_mm < 0 or target_mm > self._config.focus_range_mm:
+                    return CommandStatus.PositionOutsideLimits
+
+                self._target_mm = target_mm
+            return self.__commit()
+
+    @Pyro4.expose
+    def stop(self):
+        """Stop any in progress movement"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        if not self._moving:
+            return CommandStatus.Succeeded
+
+        self._request_stop = True
+
+        start = Time.now()
+        while True:
+            if not self._moving:
+                return CommandStatus.Succeeded
+
+            if Time.now() - start > self._config.serial_timeout * u.s:
+                return CommandStatus.Failed
+
+            time.sleep(0.1)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='OK3Z Focuser Server')
+    parser.add_argument('config', help='Path to configuration json file')
+    args = parser.parse_args()
+    _config = Config(args.config)
+    _config.daemon.launch(OK3ZFocuserDaemon(_config))
