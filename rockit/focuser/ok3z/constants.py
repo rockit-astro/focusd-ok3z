@@ -16,8 +16,6 @@
 
 """Constants and status codes used by focusd"""
 
-from rockit.common import TFmt
-
 
 class CommandStatus:
     """Numeric return codes"""
@@ -61,21 +59,22 @@ class FocuserStatus:
         2: 'MOVING'
     }
 
-    _formats = {
-        0: TFmt.Bold + TFmt.Red,
-        1: TFmt.Bold,
-        2: TFmt.Bold + TFmt.Yellow
+    _colors = {
+        0: 'red',
+        1: 'default',
+        2: 'yellow'
     }
 
     @classmethod
     def label(cls, status, formatting=False):
-        """Returns a human readable string describing a status
-           Set formatting=true to enable terminal formatting characters
+        """
+        Returns a human readable string describing a status
+        Set formatting=true to enable terminal formatting characters
         """
         if formatting:
-            if status in cls._formats and status in cls._formats:
-                return cls._formats[status] + cls._labels[status] + TFmt.Clear
-            return TFmt.Red + TFmt.Bold + 'UNKNOWN' + TFmt.Clear
+            if status in cls._labels and status in cls._colors:
+                return f'[b][{cls._colors[status]}]{cls._labels[status]}[/{cls._colors[status]}][/b]'
+            return '[b][red]UNKNOWN[/red][/b]'
 
         if status in cls._labels:
             return cls._labels[status]

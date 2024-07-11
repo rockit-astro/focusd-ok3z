@@ -22,7 +22,7 @@ import json
 import os
 import sys
 import Pyro4
-from rockit.common import TFmt
+from rockit.common import print
 from rockit.focuser.ok3z import Config, CommandStatus, FocuserStatus
 
 
@@ -63,10 +63,10 @@ def print_status(config, _):
 
     label = f'Focuser is {FocuserStatus.label(data["status"], True)}'
     if data['status'] == FocuserStatus.Idle:
-        label += f' ({TFmt.Bold}{data["current_mm"]:.3f}{TFmt.Clear} mm)'
+        label += f' ([b]{data["current_mm"]:.3f}[/b] mm)'
     elif data['status'] == FocuserStatus.Moving:
-        label += f' ({TFmt.Bold}{data["current_mm"]:.3f}{TFmt.Clear} / '
-        label += f'{TFmt.Bold}{data["target_mm"]:.3f}{TFmt.Clear} mm)'
+        label += f' ([b]{data["current_mm"]:.3f}[/b] / '
+        label += f'[b]{data["target_mm"]:.3f}[/b] mm)'
 
     print(label)
     return 0
@@ -132,7 +132,7 @@ def shutdown(config, *_):
 
 def print_usage():
     """Prints the utility help"""
-    print(f'usage: {SCRIPT_NAME} <command> [<args>]')
+    print(f'usage: {SCRIPT_NAME} <command> \\[<args>]')
     print()
     print('general commands:')
     print('   set          request the focuser to move to a given absolute position')
